@@ -1,5 +1,5 @@
 FROM openshift/origin-base AS builder
-
+WORKDIR /tmp
 RUN if [ $(uname -m) = "x86_64" ]; then \
       yum install -y gcc git make genisoimage xz-devel grub2 grub2-efi-x64 shim dosfstools mtools && \
       dd bs=1024 count=3200 if=/dev/zero of=esp.img && \
@@ -13,19 +13,36 @@ RUN if [ $(uname -m) = "x86_64" ]; then \
       touch /tmp/esp.img; \
     fi
 
+## Build iPXE w/ IPv6 Support
+## Note: we are pinning to a specific commit for reproducible builds.
+## Updated as needed.
+RUN git clone http://git.ipxe.org/ipxe.git && \
+      cd ipxe && \
+      git checkout 3fe683ebab29afacf224e6b0921f6329bebcdca7 && \
+      cd src && \
+      sed -i -e "s/#undef.*NET_PROTO_IPV6/#define NET_PROTO_IPV6/g" config/general.h && \
+      make bin/undionly.kpxe bin-x86_64-efi/ipxe.efi bin-x86_64-efi/snponly.efi
+
 FROM ubi8
 
 RUN yum update -y && \
     yum install -y python3-gunicorn openstack-ironic-api openstack-ironic-conductor crudini \
         iproute iptables dnsmasq httpd qemu-img parted gdisk ipxe-bootimgs psmisc procps-ng \
-        mariadb-server ipxe-roms-qemu genisoimage python3-ironic-prometheus-exporter && \
+        mariadb-server ipxe-roms-qemu genisoimage python3-ironic-prometheus-exporter \
+        python3-jinja2 && \
     yum clean all && \
     rm -rf /var/cache/{yum,dnf}/*
 
-COPY ./prepare-ipxe.sh /tmp
-RUN chmod +x /tmp/prepare-ipxe.sh && /tmp/prepare-ipxe.sh && rm /tmp/prepare-ipxe.sh
+# TODO(stbenjam): Uncomment when IPv6 is available in RPM's
+#COPY ./prepare-ipxe.sh /tmp
+#RUN chmod +x /tmp/prepare-ipxe.sh && /tmp/prepare-ipxe.sh && rm /tmp/prepare-ipxe.sh
 
 COPY --from=builder /tmp/esp.img /httpboot/uefi_esp.img
+
+RUN mkdir -p /tftpboot
+COPY --from=builder /tmp/ipxe/src/bin/undionly.kpxe /tftpboot
+COPY --from=builder /tmp/ipxe/src/bin-x86_64-efi/snponly.efi /tftpboot
+COPY --from=builder /tmp/ipxe/src/bin-x86_64-efi/ipxe.efi /tftpboot
 
 COPY ./ironic.conf /tmp/ironic.conf
 RUN crudini --merge /etc/ironic/ironic.conf < /tmp/ironic.conf && \
@@ -38,13 +55,14 @@ COPY ./rundnsmasq.sh /bin/rundnsmasq
 COPY ./runhttpd.sh /bin/runhttpd
 COPY ./runmariadb.sh /bin/runmariadb
 COPY ./configure-ironic.sh /bin/configure-ironic.sh
+COPY ./ironic-common.sh /bin/ironic-common.sh
 
 # TODO(dtantsur): remove these 2 scripts if we decide to
 # stop supporting running all 2 processes via one entry point.
 COPY ./runhealthcheck.sh /bin/runhealthcheck
 COPY ./runironic.sh /bin/runironic
 
-COPY ./dnsmasq.conf /etc/dnsmasq.conf
+COPY ./dnsmasq.conf.j2 /etc/dnsmasq.conf.j2
 COPY ./inspector.ipxe /tmp/inspector.ipxe
 COPY ./dualboot.ipxe /tmp/dualboot.ipxe
 
